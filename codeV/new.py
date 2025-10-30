@@ -2,7 +2,7 @@ import open3d as o3d
 import numpy as np
 from sklearn.decomposition import PCA
 from scipy.ndimage import gaussian_filter1d
-import os # 👈 New import for creating directories
+import os 
 
 # ==============================================================
 # 1. CORE UTILITIES (Unchanged)
@@ -111,8 +111,9 @@ def detect_spinal_midline_projection_method(
 ):
     allPoints = np.asarray(backMesh.sample_points_uniformly(number_of_points=80000).points)
     y_min, y_max = allPoints[:, 1].min(), allPoints[:, 1].max()
-    valid_min = y_min + top_cut * (y_max - y_min)
-    valid_max = y_max - bottom_cut * (y_max - y_min)
+    total_height = y_max - y_min
+    valid_min = y_min + top_cut * total_height
+    valid_max = y_max - bottom_cut * total_height
     sliceHeights = np.linspace(valid_min, valid_max, num=num_slices)
 
     spinalMidlinePoints = []
@@ -182,7 +183,7 @@ def save_top_down_view(slice_data, filename):
     vis = o3d.visualization.Visualizer()
     vis.create_window(width=1280, height=720, visible=False) # Create an off-screen window
     vis.add_geometry(slice_pcd)
-    vis.add_geometry(ref_line)
+    #vis.add_geometry(ref_line)
     vis.add_geometry(valley_sphere)
     
     # 3. Set the camera to a perfect top-down view
@@ -215,7 +216,7 @@ def save_top_down_view(slice_data, filename):
 # ==============================================================
 
 def main():
-    ply_path = "07521072017_back.ply" # 👈 Make sure this file exists
+    ply_path = "08110112016_back.ply" # 👈 Make sure this file exists
     output_dir = "cross_section_top_views"
     
     # Create the output directory if it doesn't exist
