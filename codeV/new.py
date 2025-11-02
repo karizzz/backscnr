@@ -42,7 +42,7 @@ def get_adaptive_torso_dimensions(vertices):
 
 
 # ==============================================================
-# 2. CORE PROJECTION LOGIC (Unchanged)
+# 2.  PROJECTION LOGIC (Unchanged)
 # ==============================================================
 
 def _find_deepest_point_by_projection(points_in_slice, store_vis=False):
@@ -97,10 +97,6 @@ def _find_deepest_point_by_projection(points_in_slice, store_vis=False):
         }
 
     return deepest_point, vis_data
-
-# ==============================================================
-# 3. PIPELINE FUNCTION (Unchanged)
-# ==============================================================
 
 def detect_spinal_midline_projection_method(
     backMesh,
@@ -157,10 +153,6 @@ def detect_spinal_midline_projection_method(
     return spinalMidlinePoints, debug_vis_data
 
 
-# ==============================================================
-# 4. 🧩 NEW: TOP-DOWN IMAGE SAVING FUNCTION
-# ==============================================================
-
 def save_top_down_view(slice_data, filename):
     """
     Creates a top-down visualization of a single slice and saves it to a file.
@@ -211,9 +203,6 @@ def save_top_down_view(slice_data, filename):
     vis.destroy_window()
 
 
-# ==============================================================
-# 5. MAIN EXECUTION AND VISUALIZATION (Modified)
-# ==============================================================
 
 def main():
     ply_path = "08110112016_back.ply" # 👈 Make sure this file exists
