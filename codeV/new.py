@@ -40,6 +40,20 @@ def get_adaptive_torso_dimensions(vertices):
     return {"width": x_range, "height": y_range, "depth": z_range}
 
 
+# Helper used in the slice analysis to ignore tiny wiggles on flatter backs.
+def _smoothed_depth_profile(points_pca, sigma=1.25):
+    if len(points_pca) < 5:
+        return points_pca[:, 1]
+
+    sort_idx = np.argsort(points_pca[:, 0])
+    sorted_depth = points_pca[sort_idx, 1]
+    smoothed_sorted = gaussian_filter1d(sorted_depth, sigma=sigma, mode="nearest")
+
+    smoothed = np.empty_like(sorted_depth)
+    smoothed[sort_idx] = smoothed_sorted
+    return smoothed
+
+
 # ==============================================================
 # 2. CORE PROJECTION LOGIC (Unchanged)
 # 2.  PROJECTION LOGIC (Unchanged)
@@ -53,7 +67,7 @@ def _find_deepest_point_by_projection(points_in_slice, store_vis=False):
     pca = PCA(n_components=2)
     points_2d = pca.fit_transform(points_in_slice[:, [0, 2]])
     x_pca = points_2d[:, 0]
-    slice_width = x_pca.max() - x_pca.min()
+    slice_width = max(x_pca.max() - x_pca.min(), 1e-6)
 
     # Define a central search window
     primary_ratio = 0.25
@@ -71,15 +85,26 @@ def _find_deepest_point_by_projection(points_in_slice, store_vis=False):
     if len(center_points_original_coords) < 10:
         return None, None
 
-    # "Deepest and Most Central" Logic: Find the most central point among the top 5 deepest
-    num_candidates = 5
-    if len(center_points_pca_coords) < num_candidates:
-        num_candidates = len(center_points_pca_coords)
+    # Build a smoothed depth profile so flatter slices do not jump erratically
+    smoothed_depth = _smoothed_depth_profile(center_points_pca_coords)
+    depth_range = smoothed_depth.max() - smoothed_depth.min()
+    depth_range = max(depth_range, 1e-6)
 
-    candidate_indices = np.argsort(center_points_pca_coords[:, 1])[:num_candidates]
-    candidate_x_coords = center_points_pca_coords[candidate_indices, 0]
-    closest_to_center_idx_in_candidates = np.argmin(np.abs(candidate_x_coords))
-    final_best_index = candidate_indices[closest_to_center_idx_in_candidates]
+    median_x = np.median(x_pca)
+    center_penalty = np.abs(center_points_pca_coords[:, 0] - median_x)
+    if center_penalty.max() > 0:
+        center_penalty /= center_penalty.max()
+
+    depth_component = (smoothed_depth - smoothed_depth.min()) / depth_range
+
+    # When a slice is almost flat, rely more on centrality to keep the midline stable.
+    flat_ratio = depth_range / (0.04 * slice_width + 1e-6)
+    flat_ratio = np.clip(flat_ratio, 0.0, 1.0)
+    depth_weight = 0.2 + 0.6 * flat_ratio
+    center_weight = 1.0 - depth_weight
+
+    combined_score = depth_weight * depth_component + center_weight * center_penalty
+    final_best_index = np.argmin(combined_score)
     deepest_point = center_points_original_coords[final_best_index]
 
     vis_data = None
@@ -216,7 +241,7 @@ def save_top_down_view(slice_data, filename):
 # ==============================================================
 
 def main():
-    ply_path = "05804092015_back.ply" # 👈 Make sure this file exists
+    ply_path = "05127092013_back.ply" # 👈 Make sure this file exists
     output_dir = "single_cross_section_top_views"
 
     # Create the output directory if it doesn't exist
