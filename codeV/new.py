@@ -2,6 +2,8 @@ import open3d as o3d
 import numpy as np
 from sklearn.decomposition import PCA
 from scipy.ndimage import gaussian_filter1d
+import networkx as nx
+from sklearn.neighbors import kneighbors_graph
 import os
 
 # ==============================================================
@@ -54,6 +56,89 @@ def _smoothed_depth_profile(points_pca, sigma=1.25):
     return smoothed
 
 
+def _order_points_mst(points, k=10, return_indices=False):
+    """
+    Order scattered 2D points along a curve using a k-NN MST and its diameter.
+    Falls back to sorting by x if the graph is too small/disconnected.
+    """
+    points = np.asarray(points)
+    if len(points) < 3:
+        return points
+
+    A = kneighbors_graph(points, min(k, len(points) - 1), mode="distance", include_self=False)
+    G = nx.from_scipy_sparse_array(A)
+    T = nx.minimum_spanning_tree(G)
+
+    leaves = [n for n in T.nodes() if T.degree[n] == 1]
+    if len(leaves) < 2:
+        idx = np.argsort(points[:, 0])
+        return idx if return_indices else points[idx]
+
+    start = leaves[0]
+    lengths = nx.single_source_dijkstra_path_length(T, start)
+    far1 = max(lengths, key=lengths.get)
+    lengths = nx.single_source_dijkstra_path_length(T, far1)
+    far2 = max(lengths, key=lengths.get)
+
+    path = nx.shortest_path(T, far1, far2)
+    return path if return_indices else points[path]
+
+
+def _curvature_along_path(ordered_points):
+    """
+    Estimate signed curvature along an ordered 2D path.
+    Negative curvature corresponds to valleys in our convention.
+    """
+    if len(ordered_points) < 5:
+        return np.zeros(len(ordered_points))
+
+    diffs = np.diff(ordered_points, axis=0)
+    seg_lengths = np.linalg.norm(diffs, axis=1)
+    t = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    t = np.clip(t, 1e-6, None)
+
+    x = ordered_points[:, 0]
+    y = ordered_points[:, 1]
+    dx = np.gradient(x, t)
+    dy = np.gradient(y, t)
+    ddx = np.gradient(dx, t)
+    ddy = np.gradient(dy, t)
+
+    denom = np.power(dx ** 2 + dy ** 2, 1.5) + 1e-6
+    kappa = (dx * ddy - dy * ddx) / denom
+    return kappa
+
+
+def _lift_path_above_mesh(points, mesh, offset=3.0, k=12):
+    """
+    Offset a polyline slightly off the mesh along local normals
+    to avoid z-fighting in the viewer.
+    """
+    if len(points) == 0:
+        return points
+
+    mesh.compute_vertex_normals()
+    verts = np.asarray(mesh.vertices)
+    normals = np.asarray(mesh.vertex_normals)
+
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(verts))
+    tree = o3d.geometry.KDTreeFlann(pcd)
+
+    lifted = []
+    for pt in points:
+        [k_found, idx, _] = tree.search_knn_vector_3d(pt, k)
+        if k_found == 0:
+            lifted.append(pt)
+            continue
+        local_normals = normals[idx]
+        normal = np.mean(local_normals, axis=0)
+        norm = np.linalg.norm(normal) + 1e-8
+        normal /= norm
+        lifted.append(pt + normal * offset)
+
+    return np.array(lifted)
+
+
 # ==============================================================
 # 2. CORE PROJECTION LOGIC (Unchanged)
 # 2.  PROJECTION LOGIC (Unchanged)
@@ -63,58 +148,88 @@ def _find_deepest_point_by_projection(points_in_slice, store_vis=False):
     if len(points_in_slice) < 20:
         return None, None
 
-    # Perform 2D PCA on the X and Z coordinates to flatten the slice
-    pca = PCA(n_components=2)
-    points_2d = pca.fit_transform(points_in_slice[:, [0, 2]])
-    x_pca = points_2d[:, 0]
-    slice_width = max(x_pca.max() - x_pca.min(), 1e-6)
+    # Use global X to keep the search corridor anchored to the torso center
+    x_global = points_in_slice[:, 0]
+    median_x_global = np.median(x_global)
+    x_range_global = max(x_global.max() - x_global.min(), 1e-6)
 
     # Define a central search window
-    primary_ratio = 0.25
-    fallback_ratio = 0.50
-    center_width = slice_width * primary_ratio
-    center_mask = np.abs(x_pca - np.median(x_pca)) < (center_width / 2)
-    # If the primary window is too sparse, expand it
-    if np.sum(center_mask) < 5:
-        center_width = slice_width * fallback_ratio
-        center_mask = np.abs(x_pca - np.median(x_pca)) < (center_width / 2)
+    primary_ratio = 0.15
+    fallback_ratio = 0.28
+    center_width = x_range_global * primary_ratio
+    center_mask = np.abs(x_global - median_x_global) < (center_width / 2)
+
+    # If the primary window is too sparse, expand it (still centered)
+    if np.sum(center_mask) < 8:
+        center_width = x_range_global * fallback_ratio
+        center_mask = np.abs(x_global - median_x_global) < (center_width / 2)
+
+    # Final fallback: take the closest-to-center points only (to keep search restricted)
+    if np.sum(center_mask) < 6:
+        max_candidates = min(len(points_in_slice), 24)
+        closest_idx = np.argsort(np.abs(x_global - median_x_global))[:max_candidates]
+        mask = np.zeros_like(x_global, dtype=bool)
+        mask[closest_idx] = True
+        center_mask = mask
 
     center_points_original_coords = points_in_slice[center_mask]
-    center_points_pca_coords = points_2d[center_mask]
+    center_points_2d = center_points_original_coords[:, [0, 2]]  # (X, Z)
 
-    if len(center_points_original_coords) < 10:
+    if len(center_points_original_coords) < 5:
         return None, None
 
-    # Build a smoothed depth profile so flatter slices do not jump erratically
-    smoothed_depth = _smoothed_depth_profile(center_points_pca_coords)
-    depth_range = smoothed_depth.max() - smoothed_depth.min()
-    depth_range = max(depth_range, 1e-6)
+    # Order the slice using MST diameter to respect the actual cross-section shape
+    ordered_idx = _order_points_mst(center_points_2d, return_indices=True)
+    ordered_2d = center_points_2d[ordered_idx]
+    ordered_orig = center_points_original_coords[ordered_idx]
 
-    median_x = np.median(x_pca)
-    center_penalty = np.abs(center_points_pca_coords[:, 0] - median_x)
-    if center_penalty.max() > 0:
-        center_penalty /= center_penalty.max()
+    # Smooth along the ordered path
+    smooth_x = gaussian_filter1d(ordered_2d[:, 0], sigma=1.0, mode="nearest")
+    smooth_z = gaussian_filter1d(ordered_2d[:, 1], sigma=1.0, mode="nearest")
+    smooth_y = gaussian_filter1d(ordered_orig[:, 1], sigma=1.0, mode="nearest")
 
-    depth_component = (smoothed_depth - smoothed_depth.min()) / depth_range
+    # Resample uniformly along arc length for stable curvature and depth evaluation
+    diffs = np.diff(np.column_stack([smooth_x, smooth_z]), axis=0)
+    seg_lengths = np.linalg.norm(diffs, axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    if s[-1] < 1e-6:
+        return None, None
+    n_resample = 200
+    s_new = np.linspace(0, s[-1], n_resample)
+    x_rs = np.interp(s_new, s, smooth_x)
+    z_rs = np.interp(s_new, s, smooth_z)
+    y_rs = np.interp(s_new, s, smooth_y)
 
-    # When a slice is almost flat, rely more on centrality to keep the midline stable.
-    flat_ratio = depth_range / (0.04 * slice_width + 1e-6)
-    flat_ratio = np.clip(flat_ratio, 0.0, 1.0)
-    depth_weight = 0.2 + 0.6 * flat_ratio
-    center_weight = 1.0 - depth_weight
+    # Curvature in X-Z plane (signed)
+    dx = np.gradient(x_rs, s_new)
+    dz = np.gradient(z_rs, s_new)
+    ddx = np.gradient(dx, s_new)
+    ddz = np.gradient(dz, s_new)
+    denom = np.power(dx ** 2 + dz ** 2, 1.5) + 1e-6
+    curvature = (dx * ddz - dz * ddx) / denom
 
-    combined_score = depth_weight * depth_component + center_weight * center_penalty
-    final_best_index = np.argmin(combined_score)
-    deepest_point = center_points_original_coords[final_best_index]
+    # Depth scoring (global Z; valley corresponds to minimum Z)
+    depth_range = max(z_rs.max() - z_rs.min(), 1e-6)
+    depth_score = (z_rs - z_rs.min()) / depth_range
+
+    # Favor negative curvature (valleys)
+    curv_range = max(curvature.max() - curvature.min(), 1e-6)
+    curv_score = (curvature - curvature.min()) / curv_range
+
+    # Centrality in global X
+    center_penalty = np.abs(x_rs - median_x_global)
+    center_penalty /= center_penalty.max() + 1e-6
+
+    combined_score = 0.65 * depth_score + 0.25 * curv_score + 0.10 * center_penalty
+    best_idx = np.argmin(combined_score)
+    deepest_point = np.array([x_rs[best_idx], y_rs[best_idx], z_rs[best_idx]])
 
     vis_data = None
     if store_vis:
-        p1_local = np.array([x_pca.min(), 0])
-        p2_local = np.array([x_pca.max(), 0])
-        p1_orig = pca.inverse_transform(p1_local)
-        p2_orig = pca.inverse_transform(p2_local)
-        p1 = np.array([p1_orig[0], deepest_point[1], p1_orig[1]])
-        p2 = np.array([p2_orig[0], deepest_point[1], p2_orig[1]])
+        x_min = x_global.min()
+        x_max = x_global.max()
+        p1 = np.array([x_min, deepest_point[1], deepest_point[2]])
+        p2 = np.array([x_max, deepest_point[1], deepest_point[2]])
         vis_data = {
             "points_orig": points_in_slice,
             "ref_line_points": [p1, p2],
@@ -241,7 +356,7 @@ def save_top_down_view(slice_data, filename):
 # ==============================================================
 
 def main():
-    ply_path = "05127092013_back.ply" # 👈 Make sure this file exists
+    ply_path = "05310122013_back.ply" # 👈 Make sure this file exists
     output_dir = "single_cross_section_top_views"
 
     # Create the output directory if it doesn't exist
@@ -302,11 +417,8 @@ def main():
             valley_sphere.paint_uniform_color([0.0, 0.8, 0.0])
             vis_geometries.append(valley_sphere)
 
-    # Draw the final smoothed black midline path
-    z_offset = 3.0
-    points_with_offset = np.copy(spinalMidlinePoints)
-    points_with_offset[:, 2] += z_offset
-
+    # Draw the final smoothed black midline path (lifted off the mesh to avoid z-fighting)
+    points_with_offset = _lift_path_above_mesh(spinalMidlinePoints, backMesh, offset=3.0)
     final_midline_path = o3d.geometry.LineSet(
         points=o3d.utility.Vector3dVector(points_with_offset),
         lines=o3d.utility.Vector2iVector([[i, i + 1] for i in range(len(points_with_offset) - 1)]),
